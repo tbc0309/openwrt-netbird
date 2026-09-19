@@ -3,54 +3,64 @@ name: build
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 0 * * 0'
+    - cron: '0 0 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: openwrt-netbird-build
+  cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
     outputs:
-      update: ${{ env.update }}
+      build: ${{ steps.check.outputs.build }}
+      version: ${{ steps.check.outputs.version }}
+      hash: ${{ steps.check.outputs.hash }}
     steps:
       - name: Checkout
-        uses: actions/checkout@main
+        uses: actions/checkout@v4
 
-      - name: Init Env
+      - name: Check latest NetBird release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "github-actions[bot]"
-          sudo timedatectl set-timezone "Asia/Shanghai"
-  
-      - name: Check
-        run: |
-          REPO="netbirdio/netbird"
-          latesttag=$(curl -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" -sL https://api.github.com/repos/${REPO}/releases/latest | jq -r .tag_name)
-          localetag=$(grep "^PKG_VERSION" netbird/Makefile | sed "s/.*=\(.*\)/\1/")
-          if [ "${latesttag/v/}" != "${localetag}" ]; then
-            PKG_VERSION=${latesttag/v/}
-            PKG_HASH="$(curl -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" -sL https://codeload.github.com/${REPO}/tar.gz/v${PKG_VERSION} | sha256sum | cut -d ' ' -f 1)"
-            sed -i "s/^PKG_VERSION.*/PKG_VERSION:=${PKG_VERSION}/" netbird/Makefile
-            sed -i "s/^PKG_HASH.*/PKG_HASH:=${PKG_HASH}/" netbird/Makefile
-            echo "package_version=$PKG_VERSION" >>$GITHUB_ENV
+          set -euo pipefail
+          repo="netbirdio/netbird"
+          latest_tag=$(curl --fail --silent --show-error --location \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${repo}/releases/latest" | jq -r '.tag_name')
+          version="${latest_tag#v}"
+          test -n "${version}" && test "${version}" != "null"
+          hash=$(curl --fail --silent --show-error --location \
+            "https://codeload.github.com/${repo}/tar.gz/v${version}" | sha256sum | cut -d ' ' -f 1)
+          local_version=$(sed -n 's/^PKG_VERSION:=//p' netbird/Makefile)
+          release_status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/v${version}")
+
+          build=false
+          if [ "${local_version}" != "${version}" ] || [ "${release_status}" != "200" ]; then
+            build=true
           fi
-          
-      - name: Set update
-        id: set-update
-        run: |
-          git pull
-          status=$(git status -s | grep -E 'netbird/Makefile' | awk '{printf " %s", $2}')
-          if [ -n "${status}" ]; then
-            git add netbird/Makefile
-            git commit -m "update to $package_version $(date +%Y-%m-%d" "%H:%M:%S)"
-            git push -f
-            echo "update=true" >>$GITHUB_ENV
-          else
-            echo "update=false" >>$GITHUB_ENV
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            build=true
           fi
-  
+
+          echo "build=${build}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "hash=${hash}" >> "${GITHUB_OUTPUT}"
+          echo "NetBird v${version}; local v${local_version}; release HTTP ${release_status}; build=${build}"
+
   build:
     name: Build - ${{ matrix.target.arch }}
     needs: check
-    if: needs.check.outputs.update == 'true' || github.event_name == 'workflow_dispatch'
+    if: needs.check.outputs.build == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -78,61 +88,90 @@ jobs:
             sdk: "https://downloads.openwrt.org/releases/23.05.4/targets/ramips/mt7621/openwrt-sdk-23.05.4-ramips-mt7621_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
     steps:
       - name: Checkout
-        uses: actions/checkout@main
+        uses: actions/checkout@v4
+
+      - name: Update package metadata
+        env:
+          PKG_VERSION: ${{ needs.check.outputs.version }}
+          PKG_HASH: ${{ needs.check.outputs.hash }}
+        run: |
+          sed -i "s/^PKG_VERSION.*/PKG_VERSION:=${PKG_VERSION}/" netbird/Makefile
+          sed -i "s/^PKG_HASH.*/PKG_HASH:=${PKG_HASH}/" netbird/Makefile
 
       - name: Install dependencies
         run: |
-          sudo apt update
-          sudo apt install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
-          bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib \
-          git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev \
-          libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libreadline-dev libssl-dev libtool lrzsz \
-          mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pyelftools \
-          libpython3-dev qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip \
-          vim wget xmlto xxd zlib1g-dev python3-setuptools npm
-          sudo apt install --reinstall libc6
-          sudo systemctl daemon-reload
-          sudo apt -y autoremove --purge
-          sudo apt clean
+          sudo apt-get update
+          sudo apt-get install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib \
+            git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev \
+            libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libreadline-dev libssl-dev libtool lrzsz \
+            mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pyelftools \
+            libpython3-dev qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip \
+            vim wget xmlto xxd zlib1g-dev python3-setuptools npm
 
       - name: Install OpenWrt SDK
         run: |
-          wget ${{ matrix.target.sdk }} -O openwrt-sdk.tar.xz
+          wget "${{ matrix.target.sdk }}" -O openwrt-sdk.tar.xz
           tar -xf openwrt-sdk.tar.xz
           mv -f openwrt-sdk-* openwrt-sdk
 
-      - name: Build Package
+      - name: Build package
         run: |
-          git pull
           cd openwrt-sdk
           cp -rf ../netbird ./package/
-          sed -i "1i\\src-link netbird $(pwd)/package" feeds.conf.default
-
+          sed -i "1i\src-link netbird $(pwd)/package" feeds.conf.default
           ./scripts/feeds update -a
-          if [ -d ./feeds/packages/lang/golang ]; then
-            rm -rf ./feeds/packages/lang/golang
-            git clone --depth=1 -b 25.x https://github.com/sbwml/packages_lang_golang ./feeds/packages/lang/golang
-          fi
+          rm -rf ./feeds/packages/lang/golang
+          git clone --depth=1 -b 26.x https://github.com/sbwml/packages_lang_golang ./feeds/packages/lang/golang
           ./scripts/feeds install -a
-
           make defconfig
           make package/netbird/compile V=s CONFIG_NETBIRD_COMPRESS_UPX=y
-          mkdir -p packed && find bin/ -type f -name '*netbird*' -exec mv -t packed {} +
-          echo "VERSION=v$(grep "^PKG_VERSION" package/netbird/Makefile | sed "s/.*=\(.*\)/\1/")" >>$GITHUB_ENV
+          mkdir -p packed
+          find bin/ -type f -name '*netbird*.ipk' -exec cp -t packed {} +
 
-      - name: Upload to Artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: netbird-${{ matrix.target.arch }}
           path: openwrt-sdk/packed/*.ipk
           if-no-files-found: error
 
-      - name: Upload firmware to release
-        uses: softprops/action-gh-release@v2
-        if: success() && !cancelled()
+  release:
+    name: Publish release
+    needs: [check, build]
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update package metadata
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PKG_VERSION: ${{ needs.check.outputs.version }}
+          PKG_HASH: ${{ needs.check.outputs.hash }}
+        run: |
+          sed -i "s/^PKG_VERSION.*/PKG_VERSION:=${PKG_VERSION}/" netbird/Makefile
+          sed -i "s/^PKG_HASH.*/PKG_HASH:=${PKG_HASH}/" netbird/Makefile
+          if ! git diff --quiet -- netbird/Makefile; then
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git config user.name "github-actions[bot]"
+            git add netbird/Makefile
+            git commit -m "update to ${PKG_VERSION}"
+            git push
+          fi
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
         with:
-          tag_name: ${{ env.VERSION }}
-          files: |
-            openwrt-sdk/packed/*.ipk
+          pattern: netbird-*
+          path: release
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check.outputs.version }}
+          name: NetBird v${{ needs.check.outputs.version }}
+          generate_release_notes: true
+          files: release/*.ipk
+          fail_on_unmatched_files: true
