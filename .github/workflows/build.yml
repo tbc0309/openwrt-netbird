@@ -1,4 +1,4 @@
-name: build
+name: 检查并发布 OpenWrt NetBird 软件包
 
 on:
   workflow_dispatch:
@@ -14,16 +14,17 @@ concurrency:
 
 jobs:
   check:
+    name: 检查 NetBird 最新版本
     runs-on: ubuntu-latest
     outputs:
       build: ${{ steps.check.outputs.build }}
       version: ${{ steps.check.outputs.version }}
       hash: ${{ steps.check.outputs.hash }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: 检出源码
+        uses: actions/checkout@v5
 
-      - name: Check latest NetBird release
+      - name: 检查 NetBird 最新 Release
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -58,7 +59,7 @@ jobs:
           echo "NetBird v${version}; local v${local_version}; release HTTP ${release_status}; build=${build}"
 
   build:
-    name: Build - ${{ matrix.target.arch }}
+    name: 编译 ${{ matrix.target.arch }}
     needs: check
     if: needs.check.outputs.build == 'true'
     runs-on: ubuntu-latest
@@ -87,10 +88,10 @@ jobs:
           - arch: "mipsel_24kc"
             sdk: "https://downloads.openwrt.org/releases/23.05.4/targets/ramips/mt7621/openwrt-sdk-23.05.4-ramips-mt7621_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: 检出源码
+        uses: actions/checkout@v5
 
-      - name: Update package metadata
+      - name: 更新软件包元数据
         env:
           PKG_VERSION: ${{ needs.check.outputs.version }}
           PKG_HASH: ${{ needs.check.outputs.hash }}
@@ -98,7 +99,7 @@ jobs:
           sed -i "s/^PKG_VERSION.*/PKG_VERSION:=${PKG_VERSION}/" netbird/Makefile
           sed -i "s/^PKG_HASH.*/PKG_HASH:=${PKG_HASH}/" netbird/Makefile
 
-      - name: Install dependencies
+      - name: 安装编译依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
@@ -109,13 +110,13 @@ jobs:
             libpython3-dev qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip \
             vim wget xmlto xxd zlib1g-dev python3-setuptools npm
 
-      - name: Install OpenWrt SDK
+      - name: 安装 OpenWrt SDK
         run: |
           wget "${{ matrix.target.sdk }}" -O openwrt-sdk.tar.xz
           tar -xf openwrt-sdk.tar.xz
           mv -f openwrt-sdk-* openwrt-sdk
 
-      - name: Build package
+      - name: 编译 IPK 软件包
         run: |
           cd openwrt-sdk
           cp -rf ../netbird ./package/
@@ -129,7 +130,7 @@ jobs:
           mkdir -p packed
           find bin/ -type f -name '*netbird*.ipk' -exec cp -t packed {} +
 
-      - name: Upload artifacts
+      - name: 上传编译产物
         uses: actions/upload-artifact@v4
         with:
           name: netbird-${{ matrix.target.arch }}
@@ -137,15 +138,15 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: Publish release
+    name: 发布软件包
     needs: [check, build]
     if: needs.build.result == 'success'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: 检出源码
+        uses: actions/checkout@v5
 
-      - name: Update package metadata
+      - name: 更新并提交软件包元数据
         env:
           PKG_VERSION: ${{ needs.check.outputs.version }}
           PKG_HASH: ${{ needs.check.outputs.hash }}
@@ -160,14 +161,14 @@ jobs:
             git push
           fi
 
-      - name: Download artifacts
+      - name: 下载编译产物
         uses: actions/download-artifact@v4
         with:
           pattern: netbird-*
           path: release
           merge-multiple: true
 
-      - name: Publish GitHub release
+      - name: 发布 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.check.outputs.version }}
